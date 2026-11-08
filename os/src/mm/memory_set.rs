@@ -262,6 +262,93 @@ impl MemorySet {
             false
         }
     }
+    /// whether the range [start_va, end_va) does not overlap any mapped area
+    pub fn is_free(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        self.areas.iter().all(|area| {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            end_vpn <= area_start || start_vpn >= area_end
+        })
+    }
+
+    /// unmap all pages inside [start_va, end_va) and release their frames.
+    /// return false (and change nothing) if some page in the range is unmapped.
+    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        // check that every page in the range is mapped
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            // note: translate() returns Some even for an invalid leaf PTE,
+            // so the valid bit must be checked explicitly
+            if !self.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+                return false;
+            }
+        }
+        let mut remaining_areas: Vec<MapArea> = Vec::new();
+        for mut area in self.areas.drain(..) {
+            let area_start = area.vpn_range.get_start();
+            let area_end = area.vpn_range.get_end();
+            // no overlap with the unmapped range: keep the area untouched
+            if end_vpn <= area_start || start_vpn >= area_end {
+                remaining_areas.push(area);
+                continue;
+            }
+            let unmap_start = start_vpn.max(area_start);
+            let unmap_end = end_vpn.min(area_end);
+            // release the overlapped pages
+            for vpn in VPNRange::new(unmap_start, unmap_end) {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+            // keep the left part [area_start, unmap_start)
+            let left_end = unmap_start;
+            if area_start < left_end {
+                let mut left = MapArea {
+                    vpn_range: VPNRange::new(area_start, left_end),
+                    data_frames: BTreeMap::new(),
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                };
+                for vpn in VPNRange::new(area_start, left_end) {
+                    if let Some(frame) = area.data_frames.remove(&vpn) {
+                        let ppn = frame.ppn;
+                        left.data_frames.insert(vpn, frame);
+                        self.page_table.map(
+                            vpn,
+                            ppn,
+                            PTEFlags::from_bits(left.map_perm.bits).unwrap(),
+                        );
+                    }
+                }
+                remaining_areas.push(left);
+            }
+            // keep the right part [unmap_end, area_end)
+            let right_start = unmap_end;
+            if right_start < area_end {
+                let mut right = MapArea {
+                    vpn_range: VPNRange::new(right_start, area_end),
+                    data_frames: BTreeMap::new(),
+                    map_type: area.map_type,
+                    map_perm: area.map_perm,
+                };
+                for vpn in VPNRange::new(right_start, area_end) {
+                    if let Some(frame) = area.data_frames.remove(&vpn) {
+                        let ppn = frame.ppn;
+                        right.data_frames.insert(vpn, frame);
+                        self.page_table.map(
+                            vpn,
+                            ppn,
+                            PTEFlags::from_bits(right.map_perm.bits).unwrap(),
+                        );
+                    }
+                }
+                remaining_areas.push(right);
+            }
+        }
+        self.areas = remaining_areas;
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

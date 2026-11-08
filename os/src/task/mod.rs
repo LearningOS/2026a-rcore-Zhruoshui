@@ -14,6 +14,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::mm::{MapPermission, VirtAddr};
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
@@ -132,6 +133,45 @@ impl TaskManager {
         let cur = inner.current_task;
         inner.tasks[cur].change_program_brk(size)
     }
+    /// insert a new framed area into the current task's address space
+    pub fn insert_current_framed_area(
+        &self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.insert_framed_area(start_va, end_va, permission);
+    }
+
+    /// whether [start_va, end_va) is free in the current task's address space
+    pub fn current_area_is_free(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.is_free(start_va, end_va)
+    }
+
+    /// unmap [start_va, end_va) in the current task's address space
+    pub fn munmap_current(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.munmap(start_va, end_va)
+    }
+
+    /// increase the syscall counter of the current running task
+    pub fn update_current_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+
+    /// get the syscall counter of the current running task
+    pub fn get_current_syscall_times(&self, syscall_id: usize) -> Option<u32> {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        Some(inner.tasks[cur].syscall_times[syscall_id])
+    }
 
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
@@ -201,4 +241,35 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Increase the syscall counter of `syscall_id` for the current task.
+/// Called on **every** syscall before it is dispatched, so the trace
+/// syscall itself is also counted.
+pub fn update_syscall_times(syscall_id: usize) {
+    TASK_MANAGER.update_current_syscall_times(syscall_id);
+}
+
+/// Get the syscall counter of `syscall_id` for the current task.
+pub fn current_syscall_times(syscall_id: usize) -> Option<u32> {
+    TASK_MANAGER.get_current_syscall_times(syscall_id)
+}
+
+/// whether [start_va, end_va) is free in the current task's address space
+pub fn current_area_is_free(start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    TASK_MANAGER.current_area_is_free(start_va, end_va)
+}
+
+/// insert a new framed area into the current task's address space
+pub fn insert_current_framed_area(
+    start_va: VirtAddr,
+    end_va: VirtAddr,
+    permission: MapPermission,
+) {
+    TASK_MANAGER.insert_current_framed_area(start_va, end_va, permission)
+}
+
+/// unmap [start_va, end_va) in the current task's address space
+pub fn munmap_current(start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    TASK_MANAGER.munmap_current(start_va, end_va)
 }
