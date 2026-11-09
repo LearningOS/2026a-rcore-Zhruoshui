@@ -65,14 +65,19 @@ impl FrameAllocator for StackFrameAllocator {
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
-        if let Some(ppn) = self.recycled.pop() {
-            Some(ppn.into())
+        let ppn: PhysPageNum = if let Some(ppn) = self.recycled.pop() {
+            ppn.into()
         } else if self.current == self.end {
-            None
+            return None;
         } else {
             self.current += 1;
-            Some((self.current - 1).into())
-        }
+            (self.current - 1).into()
+        };
+        // Clear the frame on allocation: recycled frames may still contain
+        // stale page-table entries (valid bit set) which would leak phantom
+        // mappings once the frame is reused as a page-table node.
+        ppn.get_bytes_array().fill(0);
+        Some(ppn)
     }
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
