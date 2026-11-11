@@ -1,5 +1,5 @@
-//! Physical page frame allocator
-
+//! Implementation of [`FrameAllocator`] which
+//! controls all the frames in the operating system.
 use super::{PhysAddr, PhysPageNum};
 use crate::config::MEMORY_END;
 use crate::sync::UPSafeCell;
@@ -42,7 +42,7 @@ trait FrameAllocator {
     fn alloc(&mut self) -> Option<PhysPageNum>;
     fn dealloc(&mut self, ppn: PhysPageNum);
 }
-
+/// an implementation for frame allocator
 pub struct StackFrameAllocator {
     current: usize,
     end: usize,
@@ -65,14 +65,19 @@ impl FrameAllocator for StackFrameAllocator {
         }
     }
     fn alloc(&mut self) -> Option<PhysPageNum> {
-        if let Some(ppn) = self.recycled.pop() {
-            Some(ppn.into())
+        let ppn: PhysPageNum = if let Some(ppn) = self.recycled.pop() {
+            ppn.into()
         } else if self.current == self.end {
-            None
+            return None;
         } else {
             self.current += 1;
-            Some((self.current - 1).into())
-        }
+            (self.current - 1).into()
+        };
+        // Clear the frame on allocation: recycled frames may still contain
+        // stale page-table entries (valid bit set) which would leak phantom
+        // mappings once the frame is reused as a page-table node.
+        ppn.get_bytes_array().fill(0);
+        Some(ppn)
     }
     fn dealloc(&mut self, ppn: PhysPageNum) {
         let ppn = ppn.0;
@@ -88,10 +93,11 @@ impl FrameAllocator for StackFrameAllocator {
 type FrameAllocatorImpl = StackFrameAllocator;
 
 lazy_static! {
+    /// frame allocator instance through lazy_static!
     pub static ref FRAME_ALLOCATOR: UPSafeCell<FrameAllocatorImpl> =
         unsafe { UPSafeCell::new(FrameAllocatorImpl::new()) };
 }
-
+/// initiate the frame allocator using `ekernel` and `MEMORY_END`
 pub fn init_frame_allocator() {
     extern "C" {
         fn ekernel();
@@ -116,6 +122,7 @@ pub fn frame_dealloc(ppn: PhysPageNum) {
 }
 
 #[allow(unused)]
+/// a simple test for frame allocator
 pub fn frame_allocator_test() {
     let mut v: Vec<FrameTracker> = Vec::new();
     for i in 0..5 {

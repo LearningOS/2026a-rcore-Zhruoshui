@@ -1,4 +1,4 @@
-use crate::fs::{make_pipe, open_file, OpenFlags, Stat};
+use crate::fs::{make_pipe, open_file, OpenFlags, ROOT_INODE, Stat};
 use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::sync::Arc;
@@ -123,29 +123,74 @@ pub fn sys_dup(fd: usize) -> isize {
     new_fd as isize
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
+/// fstat: get the stat of the file referenced by `fd`
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_fstat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let process = current_process();
+    let process_inner = process.inner_exclusive_access();
+    if fd >= process_inner.fd_table.len() {
+        return -1;
+    }
+    let file = match &process_inner.fd_table[fd] {
+        Some(f) => Arc::clone(f),
+        None => return -1,
+    };
+    drop(process_inner);
+    drop(process);
+    let stat = match file.fstat() {
+        Some(s) => s,
+        None => return -1,
+    };
+    // the Stat may be split across two pages, so translate page by page
+    let token = current_user_token();
+    let buf = translated_byte_buffer(token, st as *const u8, core::mem::size_of::<Stat>());
+    let mut iter = stat
+        .dev
+        .to_le_bytes()
+        .into_iter()
+        .chain(stat.ino.to_le_bytes())
+        .chain(stat.mode.bits().to_le_bytes())
+        .chain(stat.nlink.to_le_bytes());
+    for slice in buf {
+        for byte in slice.iter_mut() {
+            if let Some(b) = iter.next() {
+                *byte = b;
+            }
+        }
+    }
+    0
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
+/// linkat: create a hard link `new_name` for the file `old_name`
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let old_name = translated_str(token, old_name);
+    let new_name = translated_str(token, new_name);
+    if ROOT_INODE.link(old_name.as_str(), new_name.as_str()) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
+/// unlinkat: remove the directory entry `name`
+pub fn sys_unlinkat(name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let name = translated_str(token, name);
+    if ROOT_INODE.unlink(name.as_str()) {
+        0
+    } else {
+        -1
+    }
 }

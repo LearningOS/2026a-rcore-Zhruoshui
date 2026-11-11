@@ -9,6 +9,7 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -49,6 +50,14 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock detection: thread tid -> (resource id -> held count)
+    pub deadlock_alloc: BTreeMap<usize, BTreeMap<usize, usize>>,
+    /// deadlock detection: thread tid -> the resource id it is waiting for
+    pub deadlock_wait: BTreeMap<usize, usize>,
+    /// deadlock detection: resource id -> tids that have ever released(up) it
+    pub deadlock_up_history: BTreeMap<usize, Vec<usize>>,
+    /// current priority of the process
+    pub priority: usize,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +90,134 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    /// (deadlock detection) record that `tid` is waiting for resource `res`
+    pub fn deadlock_record_wait(&mut self, tid: usize, res: usize) {
+        self.deadlock_wait.insert(tid, res);
+    }
+    /// (deadlock detection) clear the wait record of `tid`
+    pub fn deadlock_clear_wait(&mut self, tid: usize) {
+        self.deadlock_wait.remove(&tid);
+    }
+    /// (deadlock detection) record that `tid` has acquired resource `res`
+    pub fn deadlock_record_alloc(&mut self, tid: usize, res: usize) {
+        *self
+            .deadlock_alloc
+            .entry(tid)
+            .or_default()
+            .entry(res)
+            .or_insert(0) += 1;
+    }
+    /// (deadlock detection) record that `tid` has released resource `res`
+    pub fn deadlock_release_alloc(&mut self, tid: usize, res: usize) {
+        if let Some(allocs) = self.deadlock_alloc.get_mut(&tid) {
+            if let Some(cnt) = allocs.get_mut(&res) {
+                if *cnt > 0 {
+                    *cnt -= 1;
+                }
+            }
+        }
+    }
+    /// (deadlock detection) drop all records of a thread that exited
+    pub fn deadlock_clear_thread(&mut self, tid: usize) {
+        self.deadlock_wait.remove(&tid);
+        self.deadlock_alloc.remove(&tid);
+    }
+    /// (deadlock detection) record that `tid` has released (up) the
+    /// semaphore resource `res`
+    pub fn deadlock_record_up(&mut self, res: usize, tid: usize) {
+        self.deadlock_up_history.entry(res).or_default().push(tid);
+    }
+    /// (deadlock detection) decide whether the requesting thread `tid`
+    /// can eventually make progress:
+    ///  - a thread that is not waiting can always run (and may release);
+    ///  - waiting for a mutex can only be satisfied by ANOTHER holder of
+    ///    the mutex that can itself make progress;
+    ///  - waiting for a semaphore can also be satisfied by a thread that
+    ///    has ever released (up) that semaphore and can make progress,
+    ///    because semaphore `up` creates new instances.
+    /// The judgement is propagated iteratively from the non-waiting
+    /// threads until a fixed point; deadlock iff `tid` stays unsatisfied.
+    pub fn deadlock_detect(&self, tid: usize) -> bool {
+        let tids: Vec<usize> = {
+            let mut v: Vec<usize> = Vec::new();
+            for t in self
+                .deadlock_alloc
+                .keys()
+                .chain(self.deadlock_wait.keys())
+                .chain(core::iter::once(&tid))
+            {
+                if !v.contains(t) {
+                    v.push(*t);
+                }
+            }
+            v
+        };
+        // sat[i] == true means tids[i] can make progress eventually
+        let mut sat: Vec<bool> = tids
+            .iter()
+            .map(|t| !self.deadlock_wait.contains_key(t))
+            .collect();
+        loop {
+            let mut progressed = false;
+            for i in 0..tids.len() {
+                if sat[i] {
+                    continue;
+                }
+                let wait_res = match self.deadlock_wait.get(&tids[i]) {
+                    Some(r) => *r,
+                    None => continue,
+                };
+                // candidate threads whose progress can satisfy the request
+                let mut candidates: Vec<usize> = Vec::new();
+                // holders of the resource
+                let mut has_holder = false;
+                for (h, allocs) in self.deadlock_alloc.iter() {
+                    if allocs.get(&wait_res).map_or(false, |c| *c > 0) {
+                        has_holder = true;
+                        if *h != tids[i] {
+                            candidates.push(*h);
+                        }
+                    }
+                }
+                // A locked mutex without any holder record is being handed
+                // over to a woken waiter whose allocation is not recorded
+                // yet; treat the wait as satisfiable to avoid false
+                // positives in this hand-over window.
+                if wait_res % 2 == 0 && !has_holder {
+                    sat[i] = true;
+                    progressed = true;
+                    continue;
+                }
+                // for semaphores, threads that have ever up'ed it as well
+                if wait_res % 2 == 1 {
+                    if let Some(ups) = self.deadlock_up_history.get(&wait_res) {
+                        for u in ups.iter() {
+                            if *u != tids[i] && !candidates.contains(u) {
+                                candidates.push(*u);
+                            }
+                        }
+                    }
+                }
+                if candidates
+                    .iter()
+                    .any(|c| match tids.iter().position(|t| t == c) {
+                        Some(j) => sat[j],
+                        None => true, // not tracked -> not waiting -> can run
+                    })
+                {
+                    sat[i] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        match tids.iter().position(|t| *t == tid) {
+            Some(i) => !sat[i],
+            None => false,
+        }
     }
 }
 
@@ -119,6 +256,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_alloc: BTreeMap::new(),
+                    deadlock_wait: BTreeMap::new(),
+                    deadlock_up_history: BTreeMap::new(),
+                    priority: crate::config::DEFAULT_TASK_PRIORITY,
                 })
             },
         });
@@ -210,6 +351,18 @@ impl ProcessControlBlock {
         *task_inner.get_trap_cx() = trap_cx;
     }
 
+    /// create a brand-new child process from `elf_data` whose parent is
+    /// `self`; unlike fork it does not copy the parent address space
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        trace!("kernel: spawn");
+        let process = Self::new(elf_data);
+        // establish the parent-child relationship
+        let mut inner = self.inner_exclusive_access();
+        process.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        inner.children.push(Arc::clone(&process));
+        process
+    }
+
     /// Only support processes with a single thread.
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         trace!("kernel: fork");
@@ -245,6 +398,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_alloc: BTreeMap::new(),
+                    deadlock_wait: BTreeMap::new(),
+                    deadlock_up_history: BTreeMap::new(),
+                    priority: crate::config::DEFAULT_TASK_PRIORITY,
                 })
             },
         });
